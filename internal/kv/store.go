@@ -5,7 +5,7 @@ import "sync"
 // Store 是并发安全的内存KV
 type Store struct {
 	mu sync.RWMutex
-	m map[string]string
+	m  map[string]string
 }
 
 func NewStore() *Store {
@@ -18,7 +18,7 @@ func (s *Store) Put(key, value string) {
 	s.m[key] = value
 }
 
-func (s *Store) Get (key string) (string, bool) {
+func (s *Store) Get(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v, ok := s.m[key]
@@ -32,7 +32,7 @@ func (s *Store) Delete(key string) bool {
 		return false
 	}
 	delete(s.m, key)
-	return true;
+	return true
 }
 
 func (s *Store) Len() int {
@@ -40,6 +40,3 @@ func (s *Store) Len() int {
 	defer s.mu.RUnlock()
 	return len(s.m)
 }
-
-
-		

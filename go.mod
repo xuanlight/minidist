@@ -1,3 +1,3 @@
-module github.com/xuanlight/minidist
+module minidist
 
 go 1.27.2
