@@ -188,4 +188,8 @@ hey -z 10s -c 200 http://127.0.0.1:8080/kv/name
 ## 约定
 
 - 代码必须 `gofmt` 过；提交使用 Conventional Commits（`feat:` / `fix:` / `test:` / `docs:` / `chore:`）。
-- 提交信息示例：`feat: add tcp echo with goroutine mode`、`test: handler tests and stats`。
+- 提交信息示例：`feat: add tcp echo with goroutine mode`、`test: handler tests and stats`
+
+## License
+
+MIT © 2026 lejourenfeu。
