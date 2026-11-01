@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"runtime/debug"
 	"time"
@@ -16,37 +15,11 @@ const headerRequestID = "X-Request-ID"
 // ctxKey 是私有类型，避免与其他包的 context key 冲突。
 type ctxKey struct{}
 
-func withRequestID(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get(headerRequestID)
-		if id == "" {
-			id = newRequestID()
-		}
-		w.Header().Set(headerRequestID, id)
-
-		ctx := context.WithValue(r.Context(), ctxKey{}, id)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-func requestIDFrom(ctx context.Context) string {
-	id, _ := ctx.Value(ctxKey{}).(string)
-	return id
-}
-
-func newRequestID() string {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "unknown"
-	}
-	return hex.EncodeToString(b[:])
-}
-
 // StatusWriter 包一层 ResponseWriter，记录真正写出的状态码。
 type StatusWriter struct {
-	http.ResponseWriter // ← 嵌入：字段名就叫 ResponseWriter
-	status              int
-	wrote               bool
+	http.ResponseWriter
+	status int
+	wrote  bool
 }
 
 func (w *StatusWriter) WriteHeader(code int) {
@@ -66,8 +39,23 @@ func (w *StatusWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
-func withLogging(logger *slog.Logger, next http.Handler) http.Handler {
+func (s *Server) withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get(headerRequestID)
+		if id == "" {
+			id = newRequestID()
+		}
+		w.Header().Set(headerRequestID, id)
+
+		ctx := context.WithValue(r.Context(), ctxKey{}, id)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (s *Server) withLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.requests.Add(1) // 放在 next 之前：panic 的请求也计数
+
 		start := time.Now()
 		sw := &StatusWriter{ResponseWriter: w}
 
@@ -77,7 +65,7 @@ func withLogging(logger *slog.Logger, next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		logger.Info("request",
+		s.log.Info("request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", status,
@@ -88,14 +76,14 @@ func withLogging(logger *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
-func withRecover(logger *slog.Logger, next http.Handler) http.Handler {
+func (s *Server) withRecover(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if v := recover(); v != nil {
 				if v == http.ErrAbortHandler {
 					panic(v) // 标准库的特殊约定，必须重新抛出
 				}
-				logger.Error("panic",
+				s.log.Error("panic",
 					"err", fmt.Sprint(v),
 					"path", r.URL.Path,
 					"request_id", requestIDFrom(r.Context()),
@@ -106,4 +94,17 @@ func withRecover(logger *slog.Logger, next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(w, r)
 	})
+}
+
+func requestIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(ctxKey{}).(string)
+	return id
+}
+
+func newRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "unknown"
+	}
+	return hex.EncodeToString(b[:])
 }

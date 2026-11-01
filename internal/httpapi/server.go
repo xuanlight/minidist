@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime"
+	"sync/atomic"
+	"time"
 
 	"minidist/internal/kv"
 )
@@ -13,13 +15,15 @@ import (
 const maxBody = 1 << 20 // 1 MB
 
 type Server struct {
-	store *kv.Store
-	log   *slog.Logger
+	store    *kv.Store
+	log      *slog.Logger
+	requests atomic.Int64
+	start    time.Time
 }
 
-// New creates a new HTTP server with the given key-value store and logger.
+// New 组装路由和中间件链。
 func New(store *kv.Store, logger *slog.Logger) http.Handler {
-	s := &Server{store: store, log: logger}
+	s := &Server{store: store, log: logger, start: time.Now()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -28,17 +32,17 @@ func New(store *kv.Store, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("DELETE /kv/{key}", s.handleDelete)
 	mux.HandleFunc("GET /stats", s.handleStats)
 
-	return withRequestID(withLogging(logger, withRecover(logger, mux)))
+	// 从外到内：requestID → logging → recover → mux
+	return s.withRequestID(s.withLogging(s.withRecover(mux)))
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("OK"))
+	_, _ = io.WriteString(w, "OK")
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
-	// store.Get return string, bool
 	key := r.PathValue("key")
 
 	value, ok := s.store.Get(key)
@@ -80,10 +84,18 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"goroutines": runtime.NumGoroutine(),
-		"keys":       s.store.Len(),
-	})
-}
+	resp := struct {
+		Goroutines    int   `json:"goroutines"`
+		Requests      int64 `json:"requests"`
+		Keys          int   `json:"keys"`
+		UptimeSeconds int64 `json:"uptime_seconds"`
+	}{
+		Goroutines:    runtime.NumGoroutine(),
+		Requests:      s.requests.Load(),
+		Keys:          s.store.Len(),
+		UptimeSeconds: int64(time.Since(s.start).Seconds()),
+	}
 
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
