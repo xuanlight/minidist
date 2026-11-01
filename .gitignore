@@ -1,6 +1,3 @@
 bin/
 tmp/
-bin/
-tmp/
-tmp
-bin/
+*.swp
