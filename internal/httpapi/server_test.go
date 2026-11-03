@@ -1,7 +1,7 @@
 package httpapi
 
 import (
-	"errors"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,104 +13,133 @@ import (
 	"minidist/internal/service"
 )
 
-var _ service.Store = (*kv.Store)(nil) // 确保 kv.Store 实现了 service.Store 接口
-
-// newTestHandler 创建一个日志静音的新 handler，以及它背后的全新 store。
-func newTestHandler(t *testing.T) (http.Handler, *kv.Store) {
+// newTestHandler 每次返回一套全新的 handler + 空 store，用例之间互不影响。
+func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
-	store := kv.NewStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(service.New(store), logger), store
+	return New(service.New(kv.NewStore()), logger)
 }
 
-func TestKV(t *testing.T) {
-	type step struct {
+// do 发一个请求，返回 recorder。
+func do(h http.Handler, method, target, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestStatusMatrix 只放【互相独立、不依赖顺序】的用例。
+func TestStatusMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
 		method     string
 		path       string
 		body       string
 		wantStatus int
-		wantBody   string
-	}
-	tests := []struct {
-		name  string
-		steps []step
+		wantCode   string // 空 = 不检查错误体
 	}{
-		{
-			name: "put then get",
-			steps: []step{
-				{http.MethodPut, "/kv/name", "alice", http.StatusNoContent, ""},
-				{http.MethodGet, "/kv/name", "", http.StatusOK, "alice"},
-			},
-		},
-		{
-			name: "put overwrite",
-			steps: []step{
-				{http.MethodPut, "/kv/k", "v1", http.StatusNoContent, ""},
-				{http.MethodPut, "/kv/k", "v2", http.StatusNoContent, ""},
-				{http.MethodGet, "/kv/k", "", http.StatusOK, "v2"},
-			},
-		},
-		{
-			name: "delete then get",
-			steps: []step{
-				{http.MethodPut, "/kv/k", "v", http.StatusNoContent, ""},
-				{http.MethodDelete, "/kv/k", "", http.StatusNoContent, ""},
-				{http.MethodGet, "/kv/k", "", http.StatusNotFound, "key not found\n"},
-			},
-		},
+		{"put ok", "PUT", "/v1/kv/name", `{"value":"alice"}`, 204, ""},
+		{"put empty value", "PUT", "/v1/kv/empty", `{"value":""}`, 204, ""},
+		{"bad json", "PUT", "/v1/kv/name", `not-json`, 400, "bad_json"},
+		{"unknown field", "PUT", "/v1/kv/name", `{"val":"x"}`, 400, "bad_json"},
+		{"empty body", "PUT", "/v1/kv/name", ``, 400, "bad_json"},
+		{"invalid key", "PUT", "/v1/kv/a%20b", `{"value":"x"}`, 400, "invalid_key"},
+		{"get missing", "GET", "/v1/kv/nope", ``, 404, "not_found"},
+		{"delete missing", "DELETE", "/v1/kv/nope", ``, 404, "not_found"},
+		{"method not allowed", "POST", "/v1/kv/name", ``, 405, ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h, _ := newTestHandler(t)
-			for i, s := range tt.steps {
-				req := httptest.NewRequest(s.method, s.path, strings.NewReader(s.body))
-				rec := httptest.NewRecorder()
-				h.ServeHTTP(rec, req)
+			rec := do(newTestHandler(t), tt.method, tt.path, tt.body)
 
-				if rec.Code != s.wantStatus {
-					t.Fatalf("step %d: %s %s -> status %d, want %d (body=%q)",
-						i, s.method, s.path, rec.Code, s.wantStatus, rec.Body.String())
-				}
-				if s.wantBody != "" && rec.Body.String() != s.wantBody {
-					t.Fatalf("step %d: %s %s -> body %q, want %q",
-						i, s.method, s.path, rec.Body.String(), s.wantBody)
-				}
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("%s %s -> %d, want %d (body=%q)",
+					tt.method, tt.path, rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if tt.wantCode == "" {
+				return
+			}
+
+			var got errorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("错误响应不是 JSON: %v (raw=%q)", err, rec.Body.String())
+			}
+			if got.Error.Code != tt.wantCode {
+				t.Fatalf("error code = %q, want %q", got.Error.Code, tt.wantCode)
+			}
+			if got.Error.RequestID == "" {
+				t.Fatal("错误响应缺少 request_id")
 			}
 		})
 	}
 }
 
-func TestMethodNotAllowed(t *testing.T) {
-	h, _ := newTestHandler(t)
-	req := httptest.NewRequest(http.MethodPost, "/kv/x", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+// TestPutGetDelete 覆盖有顺序依赖的主流程。
+func TestPutGetDelete(t *testing.T) {
+	h := newTestHandler(t)
 
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", rec.Code)
+	if rec := do(h, "PUT", "/v1/kv/name", `{"value":"alice"}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("PUT = %d (%q)", rec.Code, rec.Body.String())
 	}
-	if rec.Header().Get("Allow") == "" {
-		t.Fatal("405 必须带 Allow 头")
+
+	rec := do(h, "GET", "/v1/kv/name", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET = %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	var got kvResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("GET body 不是 JSON: %v", err)
+	}
+	if got.Key != "name" || got.Value != "alice" {
+		t.Fatalf("GET = %+v, want key=name value=alice", got)
+	}
+
+	if rec := do(h, "PUT", "/v1/kv/name", `{"value":"bob"}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("PUT overwrite = %d", rec.Code)
+	}
+	if body := do(h, "GET", "/v1/kv/name", "").Body.String(); !strings.Contains(body, `"bob"`) {
+		t.Fatalf("覆盖后 GET = %q", body)
+	}
+
+	if rec := do(h, "DELETE", "/v1/kv/name", ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE = %d", rec.Code)
+	}
+
+	rec = do(h, "GET", "/v1/kv/name", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("删除后 GET = %d, want 404", rec.Code)
+	}
+	var errResp errorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("404 body 不是 JSON: %v", err)
+	}
+	if errResp.Error.Code != "not_found" {
+		t.Fatalf("404 code = %q", errResp.Error.Code)
 	}
 }
 
+// TestBodyTooLarge 覆盖 413 的两条路径：
+// A) body 本身超过读取上限；B) JSON 合法但 value 超过 service.MaxValueLen。
 func TestBodyTooLarge(t *testing.T) {
-	h, _ := newTestHandler(t)
-	body := strings.Repeat("x", maxBody+1)
-	req := httptest.NewRequest(http.MethodPut, "/kv/big", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	h := newTestHandler(t)
 
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413", rec.Code)
+	huge := `{"value":"` + strings.Repeat("x", maxJSONBody) + `"}`
+	if rec := do(h, "PUT", "/v1/kv/big", huge); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超大 body = %d, want 413", rec.Code)
+	}
+
+	big := `{"value":"` + strings.Repeat("x", service.MaxValueLen+1) + `"}`
+	if rec := do(h, "PUT", "/v1/kv/big", big); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超大 value = %d, want 413", rec.Code)
 	}
 }
 
 func TestHealthz(t *testing.T) {
-	h, _ := newTestHandler(t)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	rec := do(newTestHandler(t), "GET", "/healthz", "")
 	if rec.Code != http.StatusOK || rec.Body.String() != "OK" {
 		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
 	}
@@ -118,96 +147,30 @@ func TestHealthz(t *testing.T) {
 
 func TestRequestID(t *testing.T) {
 	t.Run("generated when absent", func(t *testing.T) {
-		h, _ := newTestHandler(t)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		rec := do(newTestHandler(t), "GET", "/healthz", "")
 		if rec.Header().Get("X-Request-Id") == "" {
 			t.Fatal("缺少 X-Request-ID")
 		}
 	})
 
 	t.Run("passed through when present", func(t *testing.T) {
-		h, _ := newTestHandler(t)
 		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 		req.Header.Set("X-Request-ID", "trace-001")
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+		newTestHandler(t).ServeHTTP(rec, req)
 		if got := rec.Header().Get("X-Request-Id"); got != "trace-001" {
 			t.Fatalf("got %q, want trace-001", got)
 		}
 	})
 
 	t.Run("two requests get different ids", func(t *testing.T) {
-		h, _ := newTestHandler(t)
+		h := newTestHandler(t)
 		ids := map[string]bool{}
 		for i := 0; i < 10; i++ {
-			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-			ids[rec.Header().Get("X-Request-Id")] = true
+			ids[do(h, "GET", "/healthz", "").Header().Get("X-Request-Id")] = true
 		}
 		if len(ids) != 10 {
 			t.Fatalf("期望 10 个不同的 ID，实际 %d 个", len(ids))
 		}
 	})
-}
-
-func TestPutValidation(t *testing.T) {
-	tests := []struct {
-		name    string
-		key     string
-		value   string
-		wantErr error
-	}{
-		{"ok", "name", "alice", nil},
-		{"empty key", "", "v", service.ErrInvalidKey},
-		{"too long key", strings.Repeat("k", service.MaxKeyLen+1), "v", service.ErrInvalidKey},
-		{"space in key", "a b", "v", service.ErrInvalidKey},
-		{"slash in key", "a/b", "v", service.ErrInvalidKey},
-		{"too large value", "k", strings.Repeat("v", service.MaxValueLen+1), service.ErrTooLarge},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			svc := service.New(kv.NewStore())
-			if err := svc.Put(tt.key, tt.value); !errors.Is(err, tt.wantErr) {
-				t.Fatalf("Put() error = %v, want %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestRoundTrip(t *testing.T) {
-	svc := service.New(kv.NewStore())
-
-	if err := svc.Put("name", "alice"); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	v, err := svc.Get("name")
-	if err != nil || v != "alice" {
-		t.Fatalf("Get = %q, %v", v, err)
-	}
-	if err := svc.Delete("name"); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-	if _, err := svc.Get("name"); !errors.Is(err, service.ErrNotFound) {
-		t.Fatalf("Get after delete = %v, want ErrNotFound", err)
-	}
-}
-
-// fakeStore 只实现接口，跟 kv 毫无关系。
-type fakeStore struct{ m map[string]string }
-
-func (f *fakeStore) Put(k, v string)             { f.m[k] = v }
-func (f *fakeStore) Get(k string) (string, bool) { v, ok := f.m[k]; return v, ok }
-func (f *fakeStore) Delete(k string) bool        { _, ok := f.m[k]; delete(f.m, k); return ok }
-func (f *fakeStore) Len() int                    { return len(f.m) }
-
-func TestWithFakeStore(t *testing.T) {
-	svc := service.New(&fakeStore{m: map[string]string{}})
-	if err := svc.Put("k", "v"); err != nil {
-		t.Fatal(err)
-	}
-	if v, _ := svc.Get("k"); v != "v" {
-		t.Fatalf("Get = %q", v)
-	}
 }

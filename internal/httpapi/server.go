@@ -1,8 +1,8 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,9 +12,6 @@ import (
 
 	"minidist/internal/service"
 )
-
-// 过渡别名：业务上限的唯一定义在 service，这里保留是为了让第 1 周的测试不用改。
-const maxBody = service.MaxValueLen
 
 type Server struct {
 	svc      *service.Service
@@ -29,9 +26,9 @@ func New(svc *service.Service, logger *slog.Logger) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
-	mux.HandleFunc("PUT /kv/{key}", s.handlePut)
-	mux.HandleFunc("GET /kv/{key}", s.handleGet)
-	mux.HandleFunc("DELETE /kv/{key}", s.handleDelete)
+	mux.HandleFunc("PUT /v1/kv/{key}", s.handlePut)
+	mux.HandleFunc("GET /v1/kv/{key}", s.handleGet)
+	mux.HandleFunc("DELETE /v1/kv/{key}", s.handleDelete)
 	mux.HandleFunc("GET /stats", s.handleStats)
 
 	// 从外到内：requestID → logging → recover → mux
@@ -44,24 +41,52 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, "OK")
 }
 
+type kvResponse struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
-	value, err := s.svc.Get(r.PathValue("key"))
+	key := r.PathValue("key")
+
+	value, err := s.svc.Get(key)
 	if err != nil {
 		s.writeServiceError(w, r, err)
 		return
 	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = io.WriteString(w, value)
+	s.writeJSON(w, http.StatusOK, kvResponse{Key: key, Value: value})
+}
+
+const maxJSONBody = service.MaxValueLen + 4096 // JSON 包装（引号、转义、键名）留点余量
+
+type putRequest struct {
+	Value string `json:"value"`
 }
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
-	// 传输层的职责是"别把内存读爆"，业务上限交给 service 判断
-	body, err := io.ReadAll(io.LimitReader(r.Body, service.MaxValueLen+1))
+	// 1) 传输层保护：别把内存读爆（多读 1 字节用来判断超限）
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBody+1))
 	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
+		s.fail(w, r, http.StatusBadRequest, "read_body", "cannot read body")
 		return
 	}
-	if err := s.svc.Put(r.PathValue("key"), string(body)); err != nil {
+	if len(body) > maxJSONBody {
+		s.fail(w, r, http.StatusRequestEntityTooLarge, "too_large", "body too large")
+		return
+	}
+
+	// 2) JSON 解析：严格模式，拼错的字段会报错而不是被静默忽略
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+
+	var req putRequest
+	if err := dec.Decode(&req); err != nil {
+		s.fail(w, r, http.StatusBadRequest, "bad_json", "invalid JSON body: "+err.Error())
+		return
+	}
+
+	// 3) 业务校验交给 service
+	if err := s.svc.Put(r.PathValue("key"), req.Value); err != nil {
 		s.writeServiceError(w, r, err)
 		return
 	}
@@ -89,23 +114,5 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: int64(time.Since(s.start).Seconds()),
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
-}
-
-// writeServiceError 把领域错误翻译成 HTTP 状态码。
-// 现在返回纯文本；Day 2 换成 JSON 错误体时，只改这一个函数。
-func (s *Server) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
-	switch {
-	case errors.Is(err, service.ErrNotFound):
-		http.Error(w, "key not found", http.StatusNotFound)
-	case errors.Is(err, service.ErrInvalidKey):
-		http.Error(w, "invalid key", http.StatusBadRequest)
-	case errors.Is(err, service.ErrTooLarge):
-		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
-	default:
-		s.log.Error("request failed", "err", err, "path", r.URL.Path,
-			"request_id", requestIDFrom(r.Context()))
-		http.Error(w, "internal error", http.StatusInternalServerError)
-	}
+	s.writeJSON(w, http.StatusOK, resp)
 }
