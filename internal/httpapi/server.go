@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,21 +10,22 @@ import (
 	"sync/atomic"
 	"time"
 
-	"minidist/internal/kv"
+	"minidist/internal/service"
 )
 
-const maxBody = 1 << 20 // 1 MB
+// 过渡别名：业务上限的唯一定义在 service，这里保留是为了让第 1 周的测试不用改。
+const maxBody = service.MaxValueLen
 
 type Server struct {
-	store    *kv.Store
+	svc      *service.Service
 	log      *slog.Logger
 	requests atomic.Int64
 	start    time.Time
 }
 
 // New 组装路由和中间件链。
-func New(store *kv.Store, logger *slog.Logger) http.Handler {
-	s := &Server{store: store, log: logger, start: time.Now()}
+func New(svc *service.Service, logger *slog.Logger) http.Handler {
+	s := &Server{svc: svc, log: logger, start: time.Now()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -43,41 +45,32 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("key")
-
-	value, ok := s.store.Get(key)
-	if !ok {
-		http.Error(w, "key not found", http.StatusNotFound)
+	value, err := s.svc.Get(r.PathValue("key"))
+	if err != nil {
+		s.writeServiceError(w, r, err)
 		return
 	}
-
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = io.WriteString(w, value)
 }
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("key")
-
-	// 多读 1 字节，用来区分"刚好 1MB"和"超过 1MB"
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+	// 传输层的职责是"别把内存读爆"，业务上限交给 service 判断
+	body, err := io.ReadAll(io.LimitReader(r.Body, service.MaxValueLen+1))
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
 		return
 	}
-	if len(body) > maxBody {
-		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+	if err := s.svc.Put(r.PathValue("key"), string(body)); err != nil {
+		s.writeServiceError(w, r, err)
 		return
 	}
-
-	s.store.Put(key, string(body))
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("key")
-
-	if !s.store.Delete(key) {
-		http.Error(w, "key not found", http.StatusNotFound)
+	if err := s.svc.Delete(r.PathValue("key")); err != nil {
+		s.writeServiceError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -92,10 +85,27 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}{
 		Goroutines:    runtime.NumGoroutine(),
 		Requests:      s.requests.Load(),
-		Keys:          s.store.Len(),
+		Keys:          s.svc.Len(),
 		UptimeSeconds: int64(time.Since(s.start).Seconds()),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// writeServiceError 把领域错误翻译成 HTTP 状态码。
+// 现在返回纯文本；Day 2 换成 JSON 错误体时，只改这一个函数。
+func (s *Server) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, service.ErrNotFound):
+		http.Error(w, "key not found", http.StatusNotFound)
+	case errors.Is(err, service.ErrInvalidKey):
+		http.Error(w, "invalid key", http.StatusBadRequest)
+	case errors.Is(err, service.ErrTooLarge):
+		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+	default:
+		s.log.Error("request failed", "err", err, "path", r.URL.Path,
+			"request_id", requestIDFrom(r.Context()))
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
 }

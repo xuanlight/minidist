@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,14 +10,17 @@ import (
 	"testing"
 
 	"minidist/internal/kv"
+	"minidist/internal/service"
 )
+
+var _ service.Store = (*kv.Store)(nil) // 确保 kv.Store 实现了 service.Store 接口
 
 // newTestHandler 创建一个日志静音的新 handler，以及它背后的全新 store。
 func newTestHandler(t *testing.T) (http.Handler, *kv.Store) {
 	t.Helper()
 	store := kv.NewStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(store, logger), store
+	return New(service.New(store), logger), store
 }
 
 func TestKV(t *testing.T) {
@@ -145,4 +149,65 @@ func TestRequestID(t *testing.T) {
 			t.Fatalf("期望 10 个不同的 ID，实际 %d 个", len(ids))
 		}
 	})
+}
+
+func TestPutValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		value   string
+		wantErr error
+	}{
+		{"ok", "name", "alice", nil},
+		{"empty key", "", "v", service.ErrInvalidKey},
+		{"too long key", strings.Repeat("k", service.MaxKeyLen+1), "v", service.ErrInvalidKey},
+		{"space in key", "a b", "v", service.ErrInvalidKey},
+		{"slash in key", "a/b", "v", service.ErrInvalidKey},
+		{"too large value", "k", strings.Repeat("v", service.MaxValueLen+1), service.ErrTooLarge},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := service.New(kv.NewStore())
+			if err := svc.Put(tt.key, tt.value); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Put() error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRoundTrip(t *testing.T) {
+	svc := service.New(kv.NewStore())
+
+	if err := svc.Put("name", "alice"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	v, err := svc.Get("name")
+	if err != nil || v != "alice" {
+		t.Fatalf("Get = %q, %v", v, err)
+	}
+	if err := svc.Delete("name"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := svc.Get("name"); !errors.Is(err, service.ErrNotFound) {
+		t.Fatalf("Get after delete = %v, want ErrNotFound", err)
+	}
+}
+
+// fakeStore 只实现接口，跟 kv 毫无关系。
+type fakeStore struct{ m map[string]string }
+
+func (f *fakeStore) Put(k, v string)             { f.m[k] = v }
+func (f *fakeStore) Get(k string) (string, bool) { v, ok := f.m[k]; return v, ok }
+func (f *fakeStore) Delete(k string) bool        { _, ok := f.m[k]; delete(f.m, k); return ok }
+func (f *fakeStore) Len() int                    { return len(f.m) }
+
+func TestWithFakeStore(t *testing.T) {
+	svc := service.New(&fakeStore{m: map[string]string{}})
+	if err := svc.Put("k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := svc.Get("k"); v != "v" {
+		t.Fatalf("Get = %q", v)
+	}
 }

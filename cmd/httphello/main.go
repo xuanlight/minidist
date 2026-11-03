@@ -13,6 +13,7 @@ import (
 
 	"minidist/internal/httpapi"
 	"minidist/internal/kv"
+	"minidist/internal/service"
 )
 
 func main() {
@@ -20,12 +21,13 @@ func main() {
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		//	Level: slog.LevelInfo,
 		Level: slog.LevelInfo,
 	}))
 
+	// 装配：store（数据）→ service（业务）→ httpapi（传输）
 	store := kv.NewStore()
-	handler := httpapi.New(store, logger)
+	svc := service.New(store)
+	handler := httpapi.New(svc, logger)
 
 	srv := &http.Server{
 		Addr:              *addr,

@@ -1,0 +1,100 @@
+package httpapi
+
+import (
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"runtime"
+	"sync/atomic"
+	"time"
+
+	"minidist/internal/kv"
+)
+
+const maxBody = service.MaxBodySize
+
+type Server struct {
+	svc      *service.Service
+	log      *slog.Logger
+	requests atomic.Int64
+	start    time.Time
+}
+
+// New 组装路由和中间件链。
+func New(svc *service.Service, logger *slog.Logger) http.Handler {
+	s := &Server{svc: svc, log: logger, start: time.Now()}
+	// 路由部分不动
+}
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "OK")
+}
+
+func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
+	value, err := s.svc.Get(r.PathValue("key"))
+	if err != nil {
+		s.writeServiceError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, value)
+}
+
+func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
+	// 传输层的职责是"别把内存读爆"，业务上限交给 service 判断
+	body, err := io.ReadAll(io.LimitReader(r.Body, service.MaxValueLen+1))
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	if err := s.svc.Put(r.PathValue("key"), string(body)); err != nil {
+		s.writeServiceError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if err := s.svc.Delete(r.PathValue("key")); err != nil {
+		s.writeServiceError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	resp := struct {
+		Goroutines    int   `json:"goroutines"`
+		Requests      int64 `json:"requests"`
+		Keys          int   `json:"keys"`
+		UptimeSeconds int64 `json:"uptime_seconds"`
+	}{
+		Goroutines:    runtime.NumGoroutine(),
+		Requests:      s.requests.Load(),
+		Keys:          s.svc.Len(),
+		UptimeSeconds: int64(time.Since(s.start).Seconds()),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// writeServiceError 把领域错误翻译成 HTTP 状态码。
+// 现在返回纯文本；Day 2 换成 JSON 错误体时，只改这一个函数。
+func (s *Server) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, service.ErrNotFound):
+		http.Error(w, "key not found", http.StatusNotFound)
+	case errors.Is(err, service.ErrInvalidKey):
+		http.Error(w, "invalid key", http.StatusBadRequest)
+	case errors.Is(err, service.ErrTooLarge):
+		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+	default:
+		s.log.Error("request failed", "err", err, "path", r.URL.Path,
+			"request_id", requestIDFrom(r.Context()))
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+}
