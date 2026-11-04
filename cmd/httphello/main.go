@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,17 +11,21 @@ import (
 	"syscall"
 	"time"
 
+	"minidist/internal/config"
 	"minidist/internal/httpapi"
 	"minidist/internal/kv"
 	"minidist/internal/service"
 )
 
 func main() {
-	addr := flag.String("addr", ":8080", "listen address")
-	flag.Parse()
+	cfg, err := config.Load(os.Args[1:], os.Getenv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		os.Exit(2)
+	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: cfg.LogLevel,
 	}))
 
 	// 装配：store（数据）→ service（业务）→ httpapi（传输）
@@ -30,7 +34,7 @@ func main() {
 	handler := httpapi.New(svc, logger)
 
 	srv := &http.Server{
-		Addr:              *addr,
+		Addr:              cfg.Addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,  // 防 Slowloris
 		ReadTimeout:       10 * time.Second, // 读整个请求的上限
@@ -45,7 +49,7 @@ func main() {
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 
-	logger.Info("server started", "addr", *addr)
+	logger.Info("server started", "addr", cfg.Addr)
 
 	select {
 	case err := <-errCh:
@@ -57,7 +61,7 @@ func main() {
 		stop() // 恢复默认信号处理：第二次 Ctrl-C 直接强杀，不会卡住
 
 		logger.Info("shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
 		defer cancel()
 
 		if err := srv.Shutdown(shutdownCtx); err != nil {
