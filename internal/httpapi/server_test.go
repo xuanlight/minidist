@@ -14,10 +14,30 @@ import (
 )
 
 // newTestHandler 每次返回一套全新的 handler + 空 store，用例之间互不影响。
-func newTestHandler(t *testing.T) http.Handler {
+func newTestHandler(t *testing.T) *Server {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return New(service.New(kv.NewStore()), logger)
+}
+
+func TestReadyz(t *testing.T) {
+	s := newTestHandler(t)
+
+	if rec := do(s, "GET", "/readyz", ""); rec.Code != http.StatusOK {
+		t.Fatalf("readyz = %d, want 200", rec.Code)
+	}
+
+	s.SetDraining()
+
+	rec := do(s, "GET", "/readyz", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("draining readyz = %d, want 503", rec.Code)
+	}
+	var got errorResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if got.Error.Code != "draining" {
+		t.Fatalf("code = %q", got.Error.Code)
+	}
 }
 
 // do 发一个请求，返回 recorder。

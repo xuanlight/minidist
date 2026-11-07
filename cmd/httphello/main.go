@@ -31,11 +31,11 @@ func main() {
 	// 装配：store（数据）→ service（业务）→ httpapi（传输）
 	store := kv.NewStore()
 	svc := service.New(store)
-	handler := httpapi.New(svc, logger)
+	api := httpapi.New(svc, logger)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           handler,
+		Handler:           api,
 		ReadHeaderTimeout: 5 * time.Second,  // 防 Slowloris
 		ReadTimeout:       10 * time.Second, // 读整个请求的上限
 		WriteTimeout:      10 * time.Second, // 写响应的上限
@@ -58,9 +58,13 @@ func main() {
 			os.Exit(1)
 		}
 	case <-ctx.Done():
-		stop() // 恢复默认信号处理：第二次 Ctrl-C 直接强杀，不会卡住
-
+		stop()
 		logger.Info("shutting down")
+
+		// 先让 readiness 失败，等负载均衡把流量摘掉，再真正关闭。
+		api.SetDraining()
+		time.Sleep(2 * time.Second)
+
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
 		defer cancel()
 

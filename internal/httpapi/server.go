@@ -18,21 +18,43 @@ type Server struct {
 	log      *slog.Logger
 	requests atomic.Int64
 	start    time.Time
+	draining atomic.Bool
+	h        http.Handler
 }
 
 // New 组装路由和中间件链。
-func New(svc *service.Service, logger *slog.Logger) http.Handler {
+func New(svc *service.Service, logger *slog.Logger) *Server {
 	s := &Server{svc: svc, log: logger, start: time.Now()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("PUT /v1/kv/{key}", s.handlePut)
 	mux.HandleFunc("GET /v1/kv/{key}", s.handleGet)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("DELETE /v1/kv/{key}", s.handleDelete)
 	mux.HandleFunc("GET /stats", s.handleStats)
 
 	// 从外到内：requestID → logging → recover → mux
-	return s.withRequestID(s.withLogging(s.withRecover(mux)))
+	s.h = s.withRequestID(s.withLogging(s.withRecover(mux)))
+	return s
+}
+
+// ServeHTTP 让 *Server 自己就是一个 http.Handler：
+// 实际工作交给 New 里组装好的中间件链。
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.h.ServeHTTP(w, r)
+}
+
+// SetDraining 标记服务进入关停流程，readiness 随即失败。
+func (s *Server) SetDraining() { s.draining.Store(true) }
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if s.draining.Load() {
+		s.fail(w, r, http.StatusServiceUnavailable, "draining", "shutting down")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready"))
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
