@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -93,6 +94,80 @@ func TestStatusMatrix(t *testing.T) {
 				t.Fatal("错误响应缺少 request_id")
 			}
 		})
+	}
+}
+
+func TestStats(t *testing.T) {
+	s := newTestHandler(t)
+
+	do(s, "PUT", "/v1/kv/a", `{"value":"1"}`)
+	do(s, "PUT", "/v1/kv/b", `{"value":"2"}`)
+
+	rec := do(s, "GET", "/stats", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+
+	var got struct {
+		Goroutines    int   `json:"goroutines"`
+		Requests      int64 `json:"requests"`
+		Keys          int   `json:"keys"`
+		UptimeSeconds int64 `json:"uptime_seconds"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("body 不是 JSON: %v", err)
+	}
+
+	if got.Keys != 2 {
+		t.Fatalf("keys = %d, want 2", got.Keys)
+	}
+	if got.Requests < 3 { // 2 次 PUT + 这次 /stats
+		t.Fatalf("requests = %d, want >= 3", got.Requests)
+	}
+	if got.Goroutines <= 0 {
+		t.Fatalf("goroutines = %d", got.Goroutines)
+	}
+}
+
+func TestRecoverReturns500(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	s := New(service.New(kv.NewStore()), logger, time.Second)
+
+	h := s.withRecover(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	}))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if !strings.Contains(buf.String(), `"level":"ERROR"`) {
+		t.Fatalf("缺少错误日志: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "goroutine") {
+		t.Fatal("日志里没有堆栈")
+	}
+}
+
+func TestLoggingDefaultsTo200(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	s := New(service.New(kv.NewStore()), logger, time.Second)
+
+	h := s.withLogging(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("x")) // 故意不调 WriteHeader
+	}))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("日志不是 JSON: %v", err)
+	}
+	if entry["status"] != float64(http.StatusOK) {
+		t.Fatalf("status = %v, want 200", entry["status"])
 	}
 }
 
