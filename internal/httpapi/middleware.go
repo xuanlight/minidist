@@ -96,6 +96,15 @@ func (s *Server) withRecover(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) withTimeout(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), s.requestTimeout)
+		defer cancel()
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func requestIDFrom(ctx context.Context) string {
 	id, _ := ctx.Value(ctxKey{}).(string)
 	return id

@@ -31,7 +31,7 @@ func main() {
 	// 装配：store（数据）→ service（业务）→ httpapi（传输）
 	store := kv.NewStore()
 	svc := service.New(store)
-	api := httpapi.New(svc, logger)
+	api := httpapi.New(svc, logger, cfg.RequestTimeout)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

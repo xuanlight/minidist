@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"minidist/internal/kv"
 	"minidist/internal/service"
@@ -17,7 +18,7 @@ import (
 func newTestHandler(t *testing.T) *Server {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(service.New(kv.NewStore()), logger)
+	return New(service.New(kv.NewStore()), logger, time.Second)
 }
 
 func TestReadyz(t *testing.T) {

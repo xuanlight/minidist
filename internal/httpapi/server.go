@@ -14,17 +14,18 @@ import (
 )
 
 type Server struct {
-	svc      *service.Service
-	log      *slog.Logger
-	requests atomic.Int64
-	start    time.Time
-	draining atomic.Bool
-	h        http.Handler
+	svc            *service.Service
+	log            *slog.Logger
+	requests       atomic.Int64
+	start          time.Time
+	draining       atomic.Bool
+	h              http.Handler
+	requestTimeout time.Duration
 }
 
 // New 组装路由和中间件链。
-func New(svc *service.Service, logger *slog.Logger) *Server {
-	s := &Server{svc: svc, log: logger, start: time.Now()}
+func New(svc *service.Service, logger *slog.Logger, requestTimeout time.Duration) *Server {
+	s := &Server{svc: svc, log: logger, start: time.Now(), requestTimeout: requestTimeout}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
@@ -35,7 +36,7 @@ func New(svc *service.Service, logger *slog.Logger) *Server {
 	mux.HandleFunc("GET /stats", s.handleStats)
 
 	// 从外到内：requestID → logging → recover → mux
-	s.h = s.withRequestID(s.withLogging(s.withRecover(mux)))
+	s.h = s.withRequestID(s.withLogging(s.withTimeout(s.withRecover(mux))))
 	return s
 }
 
